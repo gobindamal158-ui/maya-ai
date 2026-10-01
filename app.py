@@ -1,20 +1,28 @@
 import os
+import urllib.parse
 import asyncio
 import tempfile
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, make_response
 from google import genai
 from google.genai import types
 import edge_tts
 
 app = Flask(__name__)
 
+# ================= CORS Allow (Blogspot ও ব্রাউজারের পারমিশন) =================
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Expose-Headers'] = 'X-Response-Text'
+    return response
+
 # ================= Render Environment Variables =================
-# GEMINI_API_KEY  : Google AI Studio key (Render Environment-e dao, code-e noy)
-# GEMINI_MODEL    : optional, default niche dewa ache
-# ADMIN_PASSCODE  : settings-er password (Render Environment-e dao, code-e likho na)
 API_KEY = os.environ.get("GEMINI_API_KEY")
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
-ADMIN_PASSCODE = os.environ.get("ADMIN_PASSCODE", "")
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash") # দ্রুত ও স্টেবল মডেল
+# Render-এ সেট না থাকলে আপনার দেওয়া আসল পাসওয়ার্ডটি ডিফল্ট হিসেবে কাজ করবে:
+ADMIN_PASSCODE = os.environ.get("ADMIN_PASSCODE", "9932857750")
 
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
@@ -27,7 +35,6 @@ bot_state = {
     "voice_gender": "female",  # female, male
     "admin_auth": False,
 }
-
 
 def get_system_prompt():
     return f"""তুমি একটি কৃত্রিম বুদ্ধিমত্তা সম্পন্ন ভয়েস অ্যাসিস্ট্যান্ট, তোমার নাম 'মায়া' (Maya)।
@@ -45,13 +52,11 @@ def get_system_prompt():
 - Doctor Mode: সাধারণ শারীরিক সমস্যায় (যেমন ঠান্ডা লাগা, জ্বর) প্যারাসিটামলের প্রাথমিক নিয়ম বলো (বড় সমস্যায় ডাক্তারের কাছে যেতে বলবে)।
 """
 
-
 def ask_gemini(contents):
     if client is None:
         raise RuntimeError("GEMINI_API_KEY set kora nei")
     resp = client.models.generate_content(model=MODEL_NAME, contents=contents)
     return (resp.text or "").strip()
-
 
 def transcribe(audio_bytes):
     prompt = ("Transcribe the spoken audio exactly as it is in Bengali, Hindi, or English. "
@@ -59,11 +64,8 @@ def transcribe(audio_bytes):
     part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
     return ask_gemini([part, prompt])
 
-
 def only_digits(text):
-    # Bangla digit (৯৯৩) o English digit dutoi 0-9 e convert kore
     return "".join(str(int(c)) for c in text if c.isdecimal())
-
 
 def decide_reply(user_text):
     lower = user_text.lower()
@@ -73,8 +75,6 @@ def decide_reply(user_text):
 
     # ---- Settings mode + admin password ----
     if "setting mode" in lower or "সেটিংস মোড" in user_text:
-        if not ADMIN_PASSCODE:
-            return "সেটিংস এখন বন্ধ আছে।"
         bot_state["mode"] = "setting"
         bot_state["admin_auth"] = False
         return "সেটিংস মোডে স্বাগতম। দয়া করে অ্যাডমিন পাসওয়ার্ড বলুন।"
@@ -96,7 +96,7 @@ def decide_reply(user_text):
         if "english" in lower or "ইংরেজি" in lower:
             bot_state["language"] = "en-US"
             return "Language changed to English."
-        if "female" in lower or "মহিলা" in lower:   # "female" age check, karon "male" ta "female"-er bhitore ache
+        if "female" in lower or "মহিলা" in lower:
             bot_state["voice_gender"] = "female"
             return "মহিলা কণ্ঠ সিলেক্ট করা হলো।"
         if "male" in lower or "পুরুষ" in lower:
@@ -131,7 +131,6 @@ def decide_reply(user_text):
         print("Chat Error:", e)
         return "দুঃখিত, এই মুহূর্তে উত্তর দিতে পারছি না। একটু পরে আবার বলো।"
 
-
 async def text_to_speech(text, output_file):
     voice_map = {
         ("bn-IN", "female"): "bn-IN-TanishaaNeural",
@@ -146,30 +145,45 @@ async def text_to_speech(text, output_file):
     communicate = edge_tts.Communicate(text, selected_voice)
     await communicate.save(output_file)
 
-
 @app.route("/")
 def home():
-    # Render server ghum theke jagate ESP32 ei page-e ping kore
     return "Maya is awake", 200
 
-
-@app.route("/process_audio", methods=["POST"])
+# ================= অডিও এবং চ্যাট প্রসেসিং রুট =================
+@app.route("/process_audio", methods=["GET", "POST", "OPTIONS"])
 def process_audio():
-    # ESP32 raw WAV body pathay; multipart 'audio' field-o cholbe
-    if "audio" in request.files:
-        audio_bytes = request.files["audio"].read()
-    else:
-        audio_bytes = request.get_data()
+    if request.method == "OPTIONS":
+        return make_response("", 200)
 
-    if not audio_bytes or len(audio_bytes) < 100:
-        return "No audio received", 400
+    # যদি ব্রাউজার বা ESP32 GET রিকোয়েস্ট করে সরাসরি MP3 শুনতে চায়
+    if request.method == "GET":
+        if os.path.exists(RESPONSE_PATH):
+            return send_file(RESPONSE_PATH, mimetype="audio/mpeg", conditional=False)
+        return "No audio ready", 200
 
     user_text = ""
-    try:
-        user_text = transcribe(audio_bytes)
-        print(f"User: {user_text}")
-    except Exception as e:
-        print("STT Error:", e)
+
+    # ১. যদি Blogspot থেকে টাইপ করে টেক্সট পাঠানো হয়
+    if "text" in request.form:
+        user_text = request.form["text"].strip()
+
+    # ২. যদি অডিও ফাইল পাঠানো হয় (ESP32 বা মাইক থেকে)
+    elif "audio" in request.files:
+        audio_bytes = request.files["audio"].read()
+        try:
+            user_text = transcribe(audio_bytes)
+            print(f"User: {user_text}")
+        except Exception as e:
+            print("STT Error:", e)
+    else:
+        # Raw bytes
+        audio_bytes = request.get_data()
+        if audio_bytes and len(audio_bytes) >= 100:
+            try:
+                user_text = transcribe(audio_bytes)
+                print(f"User: {user_text}")
+            except Exception as e:
+                print("STT Error:", e)
 
     reply_text = decide_reply(user_text)
     print(f"Maya: {reply_text}")
@@ -180,18 +194,20 @@ def process_audio():
         print("TTS Error:", e)
         return "TTS error", 500
 
-    return "OK", 200
-
+    # ব্লগে বা অ্যাপে সরাসরি MP3 অডিও রেসপন্স হিসেবে ফেরত পাঠানো
+    resp = make_response(send_file(RESPONSE_PATH, mimetype="audio/mpeg", conditional=False))
+    resp.headers["Cache-Control"] = "no-store"
+    # টেক্সট দেখানোর সুবিধার্থে হেডার যোগ করা
+    resp.headers["X-Response-Text"] = urllib.parse.quote(reply_text.encode("utf-8"))
+    return resp
 
 @app.route("/response.mp3", methods=["GET"])
 def response_mp3():
-    # ESP32 ekhan theke MP3 niye speaker-e bajay
     if not os.path.exists(RESPONSE_PATH):
         return "No response yet", 404
     resp = send_file(RESPONSE_PATH, mimetype="audio/mpeg", conditional=False)
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

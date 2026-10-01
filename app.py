@@ -9,7 +9,7 @@ import edge_tts
 
 app = Flask(__name__)
 
-# ================= CORS Allow (Blogspot ও ব্রাউজারের পারমিশন) =================
+# ================= CORS Allow =================
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -18,21 +18,20 @@ def add_cors_headers(response):
     response.headers['Access-Control-Expose-Headers'] = 'X-Response-Text'
     return response
 
-# ================= Render Environment Variables =================
+# ================= Configuration =================
 API_KEY = os.environ.get("GEMINI_API_KEY")
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash") # দ্রুত ও স্টেবল মডেল
-# Render-এ সেট না থাকলে আপনার দেওয়া আসল পাসওয়ার্ডটি ডিফল্ট হিসেবে কাজ করবে:
+# গুগলের আসল স্টেবল মডেল gemini-1.5-flash
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 ADMIN_PASSCODE = os.environ.get("ADMIN_PASSCODE", "9932857750")
 
 client = genai.Client(api_key=API_KEY) if API_KEY else None
-
 RESPONSE_PATH = os.path.join(tempfile.gettempdir(), "maya_response.mp3")
 
 bot_state = {
     "creator": "Akash Mal",
     "mode": "natural",
-    "language": "bn-IN",       # bn-IN, hi-IN, en-US
-    "voice_gender": "female",  # female, male
+    "language": "bn-IN",
+    "voice_gender": "female",
     "admin_auth": False,
 }
 
@@ -42,14 +41,14 @@ def get_system_prompt():
 
 বর্তমান নিয়মাবলী:
 ১. তোমার বর্তমান ভাষা: {bot_state['language']} (বাংলা/হিন্দি/ইংরেজি)।
-২. ব্যবহারকারীর সাথে মানুষের মতো স্বাভাবিক ও আন্তরিকভাবে কথা বলো। উত্তর যথাসম্ভব ২-৩ লাইনের মধ্যে সংক্ষেপে দেবে যাতে ভয়েসে শুনতে ভালো লাগে।
+২. ব্যবহারকারীর সাথে মানুষের মতো স্বাভাবিক ও আন্তরিকভাবে কথা বলো। উত্তর ২-৩ লাইনের মধ্যে সংক্ষেপে দেবে।
 ৩. বর্তমান মোড: {bot_state['mode']}
 
 মোড অনুযায়ী আচরণ:
 - Natural Mode: মানুষের মতো সাধারণ খোশগল্প ("তুমি কি করছো?", "কেমন আছো?").
 - Student Mode: পড়ালেখা একদম সহজ ভাষায় বুঝিয়ে দাও।
 - Kitchen Mode: রান্নার স্টেপ-বাই-স্টেপ গাইড ও Pro-tip দাও।
-- Doctor Mode: সাধারণ শারীরিক সমস্যায় (যেমন ঠান্ডা লাগা, জ্বর) প্যারাসিটামলের প্রাথমিক নিয়ম বলো (বড় সমস্যায় ডাক্তারের কাছে যেতে বলবে)।
+- Doctor Mode: সাধারণ শারীরিক সমস্যায় প্যারাসিটামলের প্রাথমিক নিয়ম বলো।
 """
 
 def ask_gemini(contents):
@@ -58,10 +57,18 @@ def ask_gemini(contents):
     resp = client.models.generate_content(model=MODEL_NAME, contents=contents)
     return (resp.text or "").strip()
 
+# অডিও ফাইল চেনার অটো-ডিটেকশন (মোবাইল WebM এবং ESP32 WAV দুটোই সাপোর্ট করবে)
 def transcribe(audio_bytes):
+    if audio_bytes.startswith(b"RIFF"):
+        audio_mime = "audio/wav"
+    elif audio_bytes.startswith(b"\x1aE\xdf\xa3"):
+        audio_mime = "audio/webm"
+    else:
+        audio_mime = "audio/webm" # মোবাইলের ডিফল্ট
+
     prompt = ("Transcribe the spoken audio exactly as it is in Bengali, Hindi, or English. "
               "Output ONLY the transcription, nothing else.")
-    part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
+    part = types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime)
     return ask_gemini([part, prompt])
 
 def only_digits(text):
@@ -71,9 +78,9 @@ def decide_reply(user_text):
     lower = user_text.lower()
 
     if not user_text:
-        return "আমি ঠিক বুঝতে পারিনি, আবার বলো।"
+        return "আমি ঠিক শুনতে পাইনি, আরেকবার বলো তো?"
 
-    # ---- Settings mode + admin password ----
+    # ---- Settings mode ----
     if "setting mode" in lower or "সেটিংস মোড" in user_text:
         bot_state["mode"] = "setting"
         bot_state["admin_auth"] = False
@@ -102,34 +109,34 @@ def decide_reply(user_text):
         if "male" in lower or "পুরুষ" in lower:
             bot_state["voice_gender"] = "male"
             return "পুরুষ কণ্ঠ সিলেক্ট করা হলো।"
-        if "exit" in lower or "বাহির" in lower or "বের" in lower:
+        if "exit" in lower or "বাহির" in lower:
             bot_state["mode"] = "natural"
             bot_state["admin_auth"] = False
             return "সেটিংস থেকে বের হওয়া হলো।"
-        return "ভাষা বা কণ্ঠ কী করতে চান? বাংলা, হিন্দি, ইংরেজি, পুরুষ, মহিলা বা এক্সিট বলুন।"
+        return "ভাষা বা কণ্ঠ কী করতে চান? বাংলা, হিন্দি, ইংরেজি, পুরুষ বা মহিলা বলুন।"
 
-    # ---- Mode change ----
-    if "student mode" in lower:
+    # ---- Modes ----
+    if "student mode" in lower or "স্টুডেন্ট মোড" in lower:
         bot_state["mode"] = "student"
         return "স্টুডেন্ট মোড চালু হয়েছে। তোমার পড়ালেখা সংক্রান্ত প্রশ্ন করো।"
-    if "kitchen mode" in lower:
+    if "kitchen mode" in lower or "কিচেন মোড" in lower:
         bot_state["mode"] = "kitchen"
         return "কিচেন মোড চালু হয়েছে। বলো আজ কী রান্না হবে?"
-    if "doctor mode" in lower:
+    if "doctor mode" in lower or "ডাক্তার মোড" in lower:
         bot_state["mode"] = "doctor"
         return "ডাক্তার মোড চালু হয়েছে। তোমার শারীরিক সমস্যার কথা বলো।"
-    if "natural mode" in lower:
+    if "natural mode" in lower or "ন্যাচারাল মোড" in lower:
         bot_state["mode"] = "natural"
         return "ন্যাচারাল মোড চালু হয়েছে।"
 
-    # ---- Normal chat ----
+    # ---- Chat ----
     try:
         chat_prompt = f"{get_system_prompt()}\n\nব্যবহারকারী বলেছেন: {user_text}\nমায়ার উত্তর:"
         reply = ask_gemini(chat_prompt).replace("*", "")
         return reply or "আমি ঠিক বুঝতে পারিনি, আবার বলো।"
     except Exception as e:
         print("Chat Error:", e)
-        return "দুঃখিত, এই মুহূর্তে উত্তর দিতে পারছি না। একটু পরে আবার বলো।"
+        return "দুঃখিত, এই মুহূর্তে উত্তর দিতে পারছি না।"
 
 async def text_to_speech(text, output_file):
     voice_map = {
@@ -140,8 +147,7 @@ async def text_to_speech(text, output_file):
         ("en-US", "female"): "en-US-JennyNeural",
         ("en-US", "male"): "en-US-GuyNeural",
     }
-    selected_voice = voice_map.get(
-        (bot_state["language"], bot_state["voice_gender"]), "bn-IN-TanishaaNeural")
+    selected_voice = voice_map.get((bot_state["language"], bot_state["voice_gender"]), "bn-IN-TanishaaNeural")
     communicate = edge_tts.Communicate(text, selected_voice)
     await communicate.save(output_file)
 
@@ -149,13 +155,11 @@ async def text_to_speech(text, output_file):
 def home():
     return "Maya is awake", 200
 
-# ================= অডিও এবং চ্যাট প্রসেসিং রুট =================
 @app.route("/process_audio", methods=["GET", "POST", "OPTIONS"])
 def process_audio():
     if request.method == "OPTIONS":
         return make_response("", 200)
 
-    # যদি ব্রাউজার বা ESP32 GET রিকোয়েস্ট করে সরাসরি MP3 শুনতে চায়
     if request.method == "GET":
         if os.path.exists(RESPONSE_PATH):
             return send_file(RESPONSE_PATH, mimetype="audio/mpeg", conditional=False)
@@ -163,25 +167,23 @@ def process_audio():
 
     user_text = ""
 
-    # ১. যদি Blogspot থেকে টাইপ করে টেক্সট পাঠানো হয়
+    # ১. টেক্সট পাঠানো হলে
     if "text" in request.form:
         user_text = request.form["text"].strip()
-
-    # ২. যদি অডিও ফাইল পাঠানো হয় (ESP32 বা মাইক থেকে)
+    # ২. অডিও ফাইল পাঠানো হলে
     elif "audio" in request.files:
         audio_bytes = request.files["audio"].read()
         try:
             user_text = transcribe(audio_bytes)
-            print(f"User: {user_text}")
+            print(f"Transcribed User Text: {user_text}")
         except Exception as e:
             print("STT Error:", e)
     else:
-        # Raw bytes
         audio_bytes = request.get_data()
         if audio_bytes and len(audio_bytes) >= 100:
             try:
                 user_text = transcribe(audio_bytes)
-                print(f"User: {user_text}")
+                print(f"Transcribed User Text: {user_text}")
             except Exception as e:
                 print("STT Error:", e)
 
@@ -194,10 +196,8 @@ def process_audio():
         print("TTS Error:", e)
         return "TTS error", 500
 
-    # ব্লগে বা অ্যাপে সরাসরি MP3 অডিও রেসপন্স হিসেবে ফেরত পাঠানো
     resp = make_response(send_file(RESPONSE_PATH, mimetype="audio/mpeg", conditional=False))
     resp.headers["Cache-Control"] = "no-store"
-    # টেক্সট দেখানোর সুবিধার্থে হেডার যোগ করা
     resp.headers["X-Response-Text"] = urllib.parse.quote(reply_text.encode("utf-8"))
     return resp
 

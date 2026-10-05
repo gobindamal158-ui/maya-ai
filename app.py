@@ -1,55 +1,62 @@
 import os
-import urllib.parse
 import asyncio
+import hmac
+import wave
 import tempfile
-from flask import Flask, request, send_file, make_response
+from flask import Flask, request, send_file
 from google import genai
 from google.genai import types
 import edge_tts
 
+try:
+    import miniaudio          # mp3 -> WAV converter (ESP32 WAV bajay)
+except Exception as _e:
+    miniaudio = None
+    print("miniaudio import failed:", _e)
+
 app = Flask(__name__)
 
-# ================= CORS Allow =================
-@app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Expose-Headers'] = 'X-Response-Text'
-    return response
-
-# ================= Configuration =================
+# ================= Render Environment Variables =================
+# GEMINI_API_KEY  : Google AI Studio key (Render Environment-e dao, code-e noy)
+# GEMINI_MODEL    : optional, default niche dewa ache
+# ADMIN_PASSCODE  : settings-er password (Render Environment-e dao, code-e likho na)
+# DEVICE_KEY      : ESP32-r gopon chabi, shudhu ESP32 e ei chabi diye server use korte parbe
 API_KEY = os.environ.get("GEMINI_API_KEY")
-# গুগলের আসল স্টেবল মডেল gemini-1.5-flash
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-ADMIN_PASSCODE = os.environ.get("ADMIN_PASSCODE", "9932857750")
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+ADMIN_PASSCODE = os.environ.get("ADMIN_PASSCODE", "")
+MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "220"))   # uttor-er sorbocho akkhor (choto uttor = druto, kom data)
+DEVICE_KEY = os.environ.get("DEVICE_KEY", "")   # ESP32-r gopon chabi (Render Environment-e dao)
 
 client = genai.Client(api_key=API_KEY) if API_KEY else None
+
 RESPONSE_PATH = os.path.join(tempfile.gettempdir(), "maya_response.mp3")
+WAV_PATH = os.path.join(tempfile.gettempdir(), "maya_response.wav")
 
 bot_state = {
     "creator": "Akash Mal",
     "mode": "natural",
-    "language": "bn-IN",
-    "voice_gender": "female",
+    "language": "bn-IN",       # bn-IN, hi-IN, en-US
+    "voice_gender": "female",  # female, male
     "admin_auth": False,
 }
 
+
 def get_system_prompt():
-    return f"""তুমি একটি কৃত্রিম বুদ্ধিমত্তা সম্পন্ন ভয়েস অ্যাসিস্ট্যান্ট, তোমার নাম 'মায়া' (Maya)।
-তোমাকে তৈরি করেছে 'আকাশ মাল' (Akash Mal)।
+    return f"""à¦¤à§à¦®à¦¿ à¦à¦•à¦Ÿà¦¿ à¦•à§ƒà¦¤à§à¦°à¦¿à¦® à¦¬à§à¦¦à§à¦§à¦¿à¦®à¦¤à§à¦¤à¦¾ à¦¸à¦®à§à¦ªà¦¨à§à¦¨ à¦­à¦¯à¦¼à§‡à¦¸ à¦…à§à¦¯à¦¾à¦¸à¦¿à¦¸à§à¦Ÿà§à¦¯à¦¾à¦¨à§à¦Ÿ, à¦¤à§‹à¦®à¦¾à¦° à¦¨à¦¾à¦® 'à¦®à¦¾à¦¯à¦¼à¦¾' (Maya)à¥¤
+à¦¤à§‹à¦®à¦¾à¦•à§‡ à¦¤à§ˆà¦°à¦¿ à¦•à¦°à§‡à¦›à§‡ 'à¦†à¦•à¦¾à¦¶ à¦®à¦¾à¦²' (Akash Mal)à¥¤
 
-বর্তমান নিয়মাবলী:
-১. তোমার বর্তমান ভাষা: {bot_state['language']} (বাংলা/হিন্দি/ইংরেজি)।
-২. ব্যবহারকারীর সাথে মানুষের মতো স্বাভাবিক ও আন্তরিকভাবে কথা বলো। উত্তর ২-৩ লাইনের মধ্যে সংক্ষেপে দেবে।
-৩. বর্তমান মোড: {bot_state['mode']}
+à¦¬à¦°à§à¦¤à¦®à¦¾à¦¨ à¦¨à¦¿à¦¯à¦¼à¦®à¦¾à¦¬à¦²à§€:
+à§§. à¦¤à§‹à¦®à¦¾à¦° à¦¬à¦°à§à¦¤à¦®à¦¾à¦¨ à¦­à¦¾à¦·à¦¾: {bot_state['language']} (à¦¬à¦¾à¦‚à¦²à¦¾/à¦¹à¦¿à¦¨à§à¦¦à¦¿/à¦‡à¦‚à¦°à§‡à¦œà¦¿)à¥¤
+à§¨. à¦¬à§à¦¯à¦¬à¦¹à¦¾à¦°à¦•à¦¾à¦°à§€à¦° à¦¸à¦¾à¦¥à§‡ à¦®à¦¾à¦¨à§à¦·à§‡à¦° à¦®à¦¤à§‹ à¦¸à§à¦¬à¦¾à¦­à¦¾à¦¬à¦¿à¦• à¦“ à¦†à¦¨à§à¦¤à¦°à¦¿à¦•à¦­à¦¾à¦¬à§‡ à¦•à¦¥à¦¾ à¦¬à¦²à§‹à¥¤ à¦‰à¦¤à§à¦¤à¦° à¦–à§à¦¬ à¦›à§‹à¦Ÿ à¦°à¦¾à¦–à¦¬à§‡: à¦¸à¦°à§à¦¬à§‹à¦šà§à¦š à§§-à§¨à¦Ÿà¦¿ à¦›à§‹à¦Ÿ à¦¬à¦¾à¦•à§à¦¯, à§¨à§« à¦¶à¦¬à§à¦¦à§‡à¦° à¦®à¦§à§à¦¯à§‡à¥¤ à¦•à§‹à¦¨à§‹ à¦¤à¦¾à¦²à¦¿à¦•à¦¾ à¦¬à¦¾ à¦¬à¦¿à¦¶à§‡à¦· à¦šà¦¿à¦¹à§à¦¨ à¦¬à§à¦¯à¦¬à¦¹à¦¾à¦° à¦•à¦°à¦¬à§‡ à¦¨à¦¾à¥¤
+à§©. à¦¬à¦°à§à¦¤à¦®à¦¾à¦¨ à¦®à§‹à¦¡: {bot_state['mode']}
 
-মোড অনুযায়ী আচরণ:
-- Natural Mode: মানুষের মতো সাধারণ খোশগল্প ("তুমি কি করছো?", "কেমন আছো?").
-- Student Mode: পড়ালেখা একদম সহজ ভাষায় বুঝিয়ে দাও।
-- Kitchen Mode: রান্নার স্টেপ-বাই-স্টেপ গাইড ও Pro-tip দাও।
-- Doctor Mode: সাধারণ শারীরিক সমস্যায় প্যারাসিটামলের প্রাথমিক নিয়ম বলো।
+à¦®à§‹à¦¡ à¦…à¦¨à§à¦¯à¦¾à¦¯à¦¼à§€ à¦†à¦šà¦°à¦£:
+- Natural Mode: à¦®à¦¾à¦¨à§à¦·à§‡à¦° à¦®à¦¤à§‹ à¦¸à¦¾à¦§à¦¾à¦°à¦£ à¦–à§‹à¦¶à¦—à¦²à§à¦ª ("à¦¤à§à¦®à¦¿ à¦•à¦¿ à¦•à¦°à¦›à§‹?", "à¦•à§‡à¦®à¦¨ à¦†à¦›à§‹?").
+- Student Mode: à¦ªà¦¡à¦¼à¦¾à¦²à§‡à¦–à¦¾ à¦à¦•à¦¦à¦® à¦¸à¦¹à¦œ à¦­à¦¾à¦·à¦¾à¦¯à¦¼ à¦¬à§à¦à¦¿à¦¯à¦¼à§‡ à¦¦à¦¾à¦“à¥¤
+- Kitchen Mode: à¦°à¦¾à¦¨à§à¦¨à¦¾à¦° à¦¸à§à¦Ÿà§‡à¦ª-à¦¬à¦¾à¦‡-à¦¸à§à¦Ÿà§‡à¦ª à¦—à¦¾à¦‡à¦¡ à¦“ Pro-tip à¦¦à¦¾à¦“à¥¤
+- Doctor Mode: à¦¸à¦¾à¦§à¦¾à¦°à¦£ à¦¶à¦¾à¦°à§€à¦°à¦¿à¦• à¦¸à¦®à¦¸à§à¦¯à¦¾à¦¯à¦¼ (à¦¯à§‡à¦®à¦¨ à¦ à¦¾à¦¨à§à¦¡à¦¾ à¦²à¦¾à¦—à¦¾, à¦œà§à¦¬à¦°) à¦ªà§à¦¯à¦¾à¦°à¦¾à¦¸à¦¿à¦Ÿà¦¾à¦®à¦²à§‡à¦° à¦ªà§à¦°à¦¾à¦¥à¦®à¦¿à¦• à¦¨à¦¿à¦¯à¦¼à¦® à¦¬à¦²à§‹ (à¦¬à¦¡à¦¼ à¦¸à¦®à¦¸à§à¦¯à¦¾à¦¯à¦¼ à¦¡à¦¾à¦•à§à¦¤à¦¾à¦°à§‡à¦° à¦•à¦¾à¦›à§‡ à¦¯à§‡à¦¤à§‡ à¦¬à¦²à¦¬à§‡)à¥¤
 """
+
 
 def ask_gemini(contents):
     if client is None:
@@ -57,86 +64,96 @@ def ask_gemini(contents):
     resp = client.models.generate_content(model=MODEL_NAME, contents=contents)
     return (resp.text or "").strip()
 
-# অডিও ফাইল চেনার অটো-ডিটেকশন (মোবাইল WebM এবং ESP32 WAV দুটোই সাপোর্ট করবে)
-def transcribe(audio_bytes):
-    if audio_bytes.startswith(b"RIFF"):
-        audio_mime = "audio/wav"
-    elif audio_bytes.startswith(b"\x1aE\xdf\xa3"):
-        audio_mime = "audio/webm"
-    else:
-        audio_mime = "audio/webm" # মোবাইলের ডিফল্ট
 
+def transcribe(audio_bytes):
     prompt = ("Transcribe the spoken audio exactly as it is in Bengali, Hindi, or English. "
               "Output ONLY the transcription, nothing else.")
-    part = types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime)
+    part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
     return ask_gemini([part, prompt])
 
+
 def only_digits(text):
+    # Bangla digit (à§¯à§¯à§©) o English digit dutoi 0-9 e convert kore
     return "".join(str(int(c)) for c in text if c.isdecimal())
+
+
+def shorten(text, limit=None):
+    # Uttor beshi lomba hole sentence-er sesh-e kete dao
+    limit = limit or MAX_REPLY_CHARS
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    last = max(cut.rfind("à¥¤"), cut.rfind("."), cut.rfind("?"), cut.rfind("!"))
+    return cut[:last + 1] if last > 40 else cut
+
 
 def decide_reply(user_text):
     lower = user_text.lower()
 
     if not user_text:
-        return "আমি ঠিক শুনতে পাইনি, আরেকবার বলো তো?"
+        return "à¦†à¦®à¦¿ à¦ à¦¿à¦• à¦¬à§à¦à¦¤à§‡ à¦ªà¦¾à¦°à¦¿à¦¨à¦¿, à¦†à¦¬à¦¾à¦° à¦¬à¦²à§‹à¥¤"
 
-    # ---- Settings mode ----
-    if "setting mode" in lower or "সেটিংস মোড" in user_text:
+    # ---- Settings mode + admin password ----
+    if "setting mode" in lower or "à¦¸à§‡à¦Ÿà¦¿à¦‚à¦¸ à¦®à§‹à¦¡" in user_text:
+        if not ADMIN_PASSCODE:
+            return "à¦¸à§‡à¦Ÿà¦¿à¦‚à¦¸ à¦à¦–à¦¨ à¦¬à¦¨à§à¦§ à¦†à¦›à§‡à¥¤"
         bot_state["mode"] = "setting"
         bot_state["admin_auth"] = False
-        return "সেটিংস মোডে স্বাগতম। দয়া করে অ্যাডমিন পাসওয়ার্ড বলুন।"
+        return "à¦¸à§‡à¦Ÿà¦¿à¦‚à¦¸ à¦®à§‹à¦¡à§‡ à¦¸à§à¦¬à¦¾à¦—à¦¤à¦®à¥¤ à¦¦à¦¯à¦¼à¦¾ à¦•à¦°à§‡ à¦…à§à¦¯à¦¾à¦¡à¦®à¦¿à¦¨ à¦ªà¦¾à¦¸à¦“à¦¯à¦¼à¦¾à¦°à§à¦¡ à¦¬à¦²à§à¦¨à¥¤"
 
     if bot_state["mode"] == "setting" and not bot_state["admin_auth"]:
         if ADMIN_PASSCODE and ADMIN_PASSCODE in only_digits(user_text):
             bot_state["admin_auth"] = True
-            return "পাসওয়ার্ড মিলে গেছে। আপনি ভাষা বা ভয়েস পরিবর্তন করতে পারেন।"
+            return "à¦ªà¦¾à¦¸à¦“à¦¯à¦¼à¦¾à¦°à§à¦¡ à¦®à¦¿à¦²à§‡ à¦—à§‡à¦›à§‡à¥¤ à¦†à¦ªà¦¨à¦¿ à¦­à¦¾à¦·à¦¾ à¦¬à¦¾ à¦­à¦¯à¦¼à§‡à¦¸ à¦ªà¦°à¦¿à¦¬à¦°à§à¦¤à¦¨ à¦•à¦°à¦¤à§‡ à¦ªà¦¾à¦°à§‡à¦¨à¥¤"
         bot_state["mode"] = "natural"
-        return "ভুল পাসওয়ার্ড! অ্যাক্সেস বাতিল।"
+        return "à¦­à§à¦² à¦ªà¦¾à¦¸à¦“à¦¯à¦¼à¦¾à¦°à§à¦¡! à¦…à§à¦¯à¦¾à¦•à§à¦¸à§‡à¦¸ à¦¬à¦¾à¦¤à¦¿à¦²à¥¤"
 
     if bot_state["mode"] == "setting" and bot_state["admin_auth"]:
-        if "bangla" in lower or "বাংলা" in lower:
+        if "bangla" in lower or "à¦¬à¦¾à¦‚à¦²à¦¾" in lower:
             bot_state["language"] = "bn-IN"
-            return "ভাষা বাংলায় পরিবর্তন করা হলো।"
-        if "hindi" in lower or "হিন্দি" in lower:
+            return "à¦­à¦¾à¦·à¦¾ à¦¬à¦¾à¦‚à¦²à¦¾à¦¯à¦¼ à¦ªà¦°à¦¿à¦¬à¦°à§à¦¤à¦¨ à¦•à¦°à¦¾ à¦¹à¦²à§‹à¥¤"
+        if "hindi" in lower or "à¦¹à¦¿à¦¨à§à¦¦à¦¿" in lower:
             bot_state["language"] = "hi-IN"
-            return "ভাষা হিন্দিতে পরিবর্তন করা হলো।"
-        if "english" in lower or "ইংরেজি" in lower:
+            return "à¦­à¦¾à¦·à¦¾ à¦¹à¦¿à¦¨à§à¦¦à¦¿à¦¤à§‡ à¦ªà¦°à¦¿à¦¬à¦°à§à¦¤à¦¨ à¦•à¦°à¦¾ à¦¹à¦²à§‹à¥¤"
+        if "english" in lower or "à¦‡à¦‚à¦°à§‡à¦œà¦¿" in lower:
             bot_state["language"] = "en-US"
             return "Language changed to English."
-        if "female" in lower or "মহিলা" in lower:
+        if "female" in lower or "à¦®à¦¹à¦¿à¦²à¦¾" in lower:   # "female" age check, karon "male" ta "female"-er bhitore ache
             bot_state["voice_gender"] = "female"
-            return "মহিলা কণ্ঠ সিলেক্ট করা হলো।"
-        if "male" in lower or "পুরুষ" in lower:
+            return "à¦®à¦¹à¦¿à¦²à¦¾ à¦•à¦£à§à¦  à¦¸à¦¿à¦²à§‡à¦•à§à¦Ÿ à¦•à¦°à¦¾ à¦¹à¦²à§‹à¥¤"
+        if "male" in lower or "à¦ªà§à¦°à§à¦·" in lower:
             bot_state["voice_gender"] = "male"
-            return "পুরুষ কণ্ঠ সিলেক্ট করা হলো।"
-        if "exit" in lower or "বাহির" in lower:
+            return "à¦ªà§à¦°à§à¦· à¦•à¦£à§à¦  à¦¸à¦¿à¦²à§‡à¦•à§à¦Ÿ à¦•à¦°à¦¾ à¦¹à¦²à§‹à¥¤"
+        if "exit" in lower or "à¦¬à¦¾à¦¹à¦¿à¦°" in lower or "à¦¬à§‡à¦°" in lower:
             bot_state["mode"] = "natural"
             bot_state["admin_auth"] = False
-            return "সেটিংস থেকে বের হওয়া হলো।"
-        return "ভাষা বা কণ্ঠ কী করতে চান? বাংলা, হিন্দি, ইংরেজি, পুরুষ বা মহিলা বলুন।"
+            return "à¦¸à§‡à¦Ÿà¦¿à¦‚à¦¸ à¦¥à§‡à¦•à§‡ à¦¬à§‡à¦° à¦¹à¦“à¦¯à¦¼à¦¾ à¦¹à¦²à§‹à¥¤"
+        return "à¦­à¦¾à¦·à¦¾ à¦¬à¦¾ à¦•à¦£à§à¦  à¦•à§€ à¦•à¦°à¦¤à§‡ à¦šà¦¾à¦¨? à¦¬à¦¾à¦‚à¦²à¦¾, à¦¹à¦¿à¦¨à§à¦¦à¦¿, à¦‡à¦‚à¦°à§‡à¦œà¦¿, à¦ªà§à¦°à§à¦·, à¦®à¦¹à¦¿à¦²à¦¾ à¦¬à¦¾ à¦à¦•à§à¦¸à¦¿à¦Ÿ à¦¬à¦²à§à¦¨à¥¤"
 
-    # ---- Modes ----
-    if "student mode" in lower or "স্টুডেন্ট মোড" in lower:
+    # ---- Mode change ----
+    if "student mode" in lower:
         bot_state["mode"] = "student"
-        return "স্টুডেন্ট মোড চালু হয়েছে। তোমার পড়ালেখা সংক্রান্ত প্রশ্ন করো।"
-    if "kitchen mode" in lower or "কিচেন মোড" in lower:
+        return "à¦¸à§à¦Ÿà§à¦¡à§‡à¦¨à§à¦Ÿ à¦®à§‹à¦¡ à¦šà¦¾à¦²à§ à¦¹à¦¯à¦¼à§‡à¦›à§‡à¥¤ à¦¤à§‹à¦®à¦¾à¦° à¦ªà¦¡à¦¼à¦¾à¦²à§‡à¦–à¦¾ à¦¸à¦‚à¦•à§à¦°à¦¾à¦¨à§à¦¤ à¦ªà§à¦°à¦¶à§à¦¨ à¦•à¦°à§‹à¥¤"
+    if "kitchen mode" in lower:
         bot_state["mode"] = "kitchen"
-        return "কিচেন মোড চালু হয়েছে। বলো আজ কী রান্না হবে?"
-    if "doctor mode" in lower or "ডাক্তার মোড" in lower:
+        return "à¦•à¦¿à¦šà§‡à¦¨ à¦®à§‹à¦¡ à¦šà¦¾à¦²à§ à¦¹à¦¯à¦¼à§‡à¦›à§‡à¥¤ à¦¬à¦²à§‹ à¦†à¦œ à¦•à§€ à¦°à¦¾à¦¨à§à¦¨à¦¾ à¦¹à¦¬à§‡?"
+    if "doctor mode" in lower:
         bot_state["mode"] = "doctor"
-        return "ডাক্তার মোড চালু হয়েছে। তোমার শারীরিক সমস্যার কথা বলো।"
-    if "natural mode" in lower or "ন্যাচারাল মোড" in lower:
+        return "à¦¡à¦¾à¦•à§à¦¤à¦¾à¦° à¦®à§‹à¦¡ à¦šà¦¾à¦²à§ à¦¹à¦¯à¦¼à§‡à¦›à§‡à¥¤ à¦¤à§‹à¦®à¦¾à¦° à¦¶à¦¾à¦°à§€à¦°à¦¿à¦• à¦¸à¦®à¦¸à§à¦¯à¦¾à¦° à¦•à¦¥à¦¾ à¦¬à¦²à§‹à¥¤"
+    if "natural mode" in lower:
         bot_state["mode"] = "natural"
-        return "ন্যাচারাল মোড চালু হয়েছে।"
+        return "à¦¨à§à¦¯à¦¾à¦šà¦¾à¦°à¦¾à¦² à¦®à§‹à¦¡ à¦šà¦¾à¦²à§ à¦¹à¦¯à¦¼à§‡à¦›à§‡à¥¤"
 
-    # ---- Chat ----
+    # ---- Normal chat ----
     try:
-        chat_prompt = f"{get_system_prompt()}\n\nব্যবহারকারী বলেছেন: {user_text}\nমায়ার উত্তর:"
-        reply = ask_gemini(chat_prompt).replace("*", "")
-        return reply or "আমি ঠিক বুঝতে পারিনি, আবার বলো।"
+        chat_prompt = f"{get_system_prompt()}\n\nà¦¬à§à¦¯à¦¬à¦¹à¦¾à¦°à¦•à¦¾à¦°à§€ à¦¬à¦²à§‡à¦›à§‡à¦¨: {user_text}\nà¦®à¦¾à¦¯à¦¼à¦¾à¦° à¦‰à¦¤à§à¦¤à¦°:"
+        reply = shorten(ask_gemini(chat_prompt).replace("*", ""))
+        return reply or "à¦†à¦®à¦¿ à¦ à¦¿à¦• à¦¬à§à¦à¦¤à§‡ à¦ªà¦¾à¦°à¦¿à¦¨à¦¿, à¦†à¦¬à¦¾à¦° à¦¬à¦²à§‹à¥¤"
     except Exception as e:
         print("Chat Error:", e)
-        return "দুঃখিত, এই মুহূর্তে উত্তর দিতে পারছি না।"
+        return "à¦¦à§à¦ƒà¦–à¦¿à¦¤, à¦à¦‡ à¦®à§à¦¹à§‚à¦°à§à¦¤à§‡ à¦‰à¦¤à§à¦¤à¦° à¦¦à¦¿à¦¤à§‡ à¦ªà¦¾à¦°à¦›à¦¿ à¦¨à¦¾à¥¤ à¦à¦•à¦Ÿà§ à¦ªà¦°à§‡ à¦†à¦¬à¦¾à¦° à¦¬à¦²à§‹à¥¤"
+
 
 async def text_to_speech(text, output_file):
     voice_map = {
@@ -147,45 +164,66 @@ async def text_to_speech(text, output_file):
         ("en-US", "female"): "en-US-JennyNeural",
         ("en-US", "male"): "en-US-GuyNeural",
     }
-    selected_voice = voice_map.get((bot_state["language"], bot_state["voice_gender"]), "bn-IN-TanishaaNeural")
+    selected_voice = voice_map.get(
+        (bot_state["language"], bot_state["voice_gender"]), "bn-IN-TanishaaNeural")
     communicate = edge_tts.Communicate(text, selected_voice)
     await communicate.save(output_file)
 
+
+def authorized():
+    # DEVICE_KEY Render-e set kora thakle shudhu sothik chabi-wala (ESP32) dhukte parbe.
+    # Set kora na thakle sobai-ke dibe (pore DEVICE_KEY set korle tala lagbe).
+    if not DEVICE_KEY:
+        return True
+    sent = request.headers.get("X-Maya-Key") or request.args.get("key") or ""
+    return hmac.compare_digest(sent.encode("utf-8"), DEVICE_KEY.encode("utf-8"))
+
+
+def mp3_to_wav16k(mp3_path, wav_path):
+    # ESP32-te MP3 decoder nei, tai server-e 16 kHz mono 16-bit WAV bonaye pathai
+    if miniaudio is None:
+        raise RuntimeError("miniaudio install hoyni")
+    with open(mp3_path, "rb") as f:
+        data = f.read()
+    decoded = miniaudio.decode(
+        data,
+        output_format=miniaudio.SampleFormat.SIGNED16,
+        nchannels=1,
+        sample_rate=16000,
+    )
+    with wave.open(wav_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(decoded.samples.tobytes())
+
+
 @app.route("/")
 def home():
+    # Render server ghum theke jagate ESP32 ei page-e ping kore
     return "Maya is awake", 200
 
-@app.route("/process_audio", methods=["GET", "POST", "OPTIONS"])
+
+@app.route("/process_audio", methods=["POST"])
 def process_audio():
-    if request.method == "OPTIONS":
-        return make_response("", 200)
+    if not authorized():
+        return "Unauthorized", 401
 
-    if request.method == "GET":
-        if os.path.exists(RESPONSE_PATH):
-            return send_file(RESPONSE_PATH, mimetype="audio/mpeg", conditional=False)
-        return "No audio ready", 200
-
-    user_text = ""
-
-    # ১. টেক্সট পাঠানো হলে
-    if "text" in request.form:
-        user_text = request.form["text"].strip()
-    # ২. অডিও ফাইল পাঠানো হলে
-    elif "audio" in request.files:
+    # ESP32 raw WAV body pathay; multipart 'audio' field-o cholbe
+    if "audio" in request.files:
         audio_bytes = request.files["audio"].read()
-        try:
-            user_text = transcribe(audio_bytes)
-            print(f"Transcribed User Text: {user_text}")
-        except Exception as e:
-            print("STT Error:", e)
     else:
         audio_bytes = request.get_data()
-        if audio_bytes and len(audio_bytes) >= 100:
-            try:
-                user_text = transcribe(audio_bytes)
-                print(f"Transcribed User Text: {user_text}")
-            except Exception as e:
-                print("STT Error:", e)
+
+    if not audio_bytes or len(audio_bytes) < 100:
+        return "No audio received", 400
+
+    user_text = ""
+    try:
+        user_text = transcribe(audio_bytes)
+        print(f"User: {user_text}")
+    except Exception as e:
+        print("STT Error:", e)
 
     reply_text = decide_reply(user_text)
     print(f"Maya: {reply_text}")
@@ -196,18 +234,38 @@ def process_audio():
         print("TTS Error:", e)
         return "TTS error", 500
 
-    resp = make_response(send_file(RESPONSE_PATH, mimetype="audio/mpeg", conditional=False))
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["X-Response-Text"] = urllib.parse.quote(reply_text.encode("utf-8"))
-    return resp
+    try:
+        mp3_to_wav16k(RESPONSE_PATH, WAV_PATH)
+    except Exception as e:
+        print("WAV Convert Error:", e)
+        return "WAV convert error", 500
+
+    return "OK", 200
+
 
 @app.route("/response.mp3", methods=["GET"])
 def response_mp3():
+    if not authorized():
+        return "Unauthorized", 401
+    # ESP32 ekhan theke MP3 niye speaker-e bajay
     if not os.path.exists(RESPONSE_PATH):
         return "No response yet", 404
     resp = send_file(RESPONSE_PATH, mimetype="audio/mpeg", conditional=False)
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+@app.route("/response.wav", methods=["GET"])
+def response_wav():
+    # ESP32 ekhan theke WAV niye nijer I2S diye speaker-e bajay
+    if not authorized():
+        return "Unauthorized", 401
+    if not os.path.exists(WAV_PATH):
+        return "No response yet", 404
+    resp = send_file(WAV_PATH, mimetype="audio/wav", conditional=False)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
